@@ -281,15 +281,17 @@ def get_menu(user=Depends(require_user)):
     return MENU
 
 
+
 @app.post("/api/orders")
 def create_order(
     data: OrderRequest,
     user=Depends(require_role("cashier", "owner")),
 ):
-    global next_order_id
-
     if data.payment_method not in {"Cash", "UPI", "Card"}:
-        raise HTTPException(status_code=400, detail="Choose Cash, UPI or Card.")
+        raise HTTPException(
+            status_code=400,
+            detail="Choose Cash, UPI or Card.",
+        )
 
     if not data.payment_confirmed:
         raise HTTPException(
@@ -297,60 +299,54 @@ def create_order(
             detail="Confirm that payment has been received before completing the order.",
         )
 
-    with lock:
-        # Validate the complete order before changing inventory.
-        selected = []
-        ingredient_totals = {}
-        subtotal = 0
-        ingredient_cost = 0
+    # Merge duplicate menu items before sending them to the database.
+    quantities = {}
+    for line in data.items:
+        quantities[line.menu_id] = (
+            quantities.get(line.menu_id, 0) + line.quantity
+        )
 
-        for line in data.items:
-            product = next((m for m in MENU if m["id"] == line.menu_id), None)
-            if not product:
-                raise HTTPException(status_code=400, detail="Unknown menu item.")
+    if any(quantity > 50 for quantity in quantities.values()):
+        raise HTTPException(
+            status_code=400,
+            detail="Maximum quantity per menu item is 50.",
+        )
 
-            subtotal += product["price"] * line.quantity
-            selected.append({
-                "menu_id": product["id"],
-                "name": product["name"],
-                "quantity": line.quantity,
-                "unit_price": product["price"],
-                "line_total": product["price"] * line.quantity,
-            })
+    try:
+        result = supabase.rpc(
+            "create_palm_bistro_order",
+            {
+                "p_items": [
+                    {"menu_id": menu_id, "quantity": quantity}
+                    for menu_id, quantity in quantities.items()
+                ],
+                "p_cashier_username": user["username"],
+                "p_collected_by": user["name"],
+                "p_payment_method": data.payment_method,
+            },
+        ).execute()
 
-            for ingredient, amount in product["recipe"].items():
-                ingredient_totals[ingredient] = (
-                    ingredient_totals.get(ingredient, 0) + amount * line.quantity
-                )
+        order = result.data
 
-        for ingredient, amount in ingredient_totals.items():
-            if stock[ingredient]["quantity"] < amount:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Not enough {stock[ingredient]['name']} to complete this order.",
-                )
-            ingredient_cost += amount * stock[ingredient]["unit_cost"]
-
-        for ingredient, amount in ingredient_totals.items():
-            stock[ingredient]["quantity"] -= amount
-
-        order = {
-            "id": next_order_id,
-            "items": selected,
-            "total": money(subtotal),
-            "payment_method": data.payment_method,
-            "payment_status": "Collected",
-            "collected_by": user["name"],
-            "cashier_username": user["username"],
-            "ingredient_cost": money(ingredient_cost),
-            "created_at": datetime.now(timezone.utc).isoformat(),
+        # Keep the existing frontend response structure.
+        return {
+            "message": "Order completed.",
+            "order": order,
         }
 
-        orders.append(order)
-        next_order_id += 1
+    except Exception as exc:
+        message = str(exc)
 
-    return {"message": "Order completed.", "order": order}
+        if "Not enough" in message:
+            raise HTTPException(status_code=409, detail=message)
 
+        if "Unknown menu item" in message or "Invalid" in message:
+            raise HTTPException(status_code=400, detail=message)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the order. Please check the dashboard before retrying.",
+        )
 
 @app.post("/api/inventory/{ingredient_id}/deliveries")
 def receive_delivery(
