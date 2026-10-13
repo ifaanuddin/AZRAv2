@@ -1,14 +1,50 @@
-
+import os
 from datetime import datetime, timezone
 from secrets import token_urlsafe
 from threading import Lock
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from supabase import create_client, Client
+
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+    raise RuntimeError(
+        "Missing SUPABASE_URL or SUPABASE_SECRET_KEY in backend/.env"
+    )
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SECRET_KEY,
+)
 
 app = FastAPI(title="AZRA - The Palm Bistro")
 lock = Lock()
+
+
+@app.get("/api/db-check")
+def check_database():
+    try:
+        result = supabase.table("ingredients").select("id").limit(1).execute()
+        return {
+            "status": "connected",
+            "message": "Supabase database query successful",
+            "rows_found": len(result.data),
+        }
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database connection failed: {exc}",
+        )
+
 
 app.add_middleware(
     CORSMiddleware,
