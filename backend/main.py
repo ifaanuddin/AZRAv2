@@ -3,6 +3,9 @@ from datetime import datetime, timezone
 from secrets import token_urlsafe
 from threading import Lock
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,7 +133,7 @@ class OrderRequest(BaseModel):
     items: list[OrderItem] = Field(min_length=1, max_length=30)
     payment_method: str
     payment_confirmed: bool
-
+    customer_name: str | None = Field(default=None, max_length=120)
 
 class StockDelivery(BaseModel):
     quantity: int = Field(gt=0, le=1000000)
@@ -400,6 +403,7 @@ def create_order(
         )
 
     try:
+        print("ORDER CHECK: endpoint reached; calling Supabase RPC", flush=True)
         result = supabase.rpc(
             "create_palm_bistro_order",
             {
@@ -410,6 +414,8 @@ def create_order(
                 "p_cashier_username": user["username"],
                 "p_collected_by": user["name"],
                 "p_payment_method": data.payment_method,
+                "p_payment_method": data.payment_method,
+                "p_customer_name": (data.customer_name or "").strip() or None,
             },
         ).execute()
 
@@ -421,8 +427,11 @@ def create_order(
             "order": order,
         }
 
+    
+    
     except Exception as exc:
         message = str(exc)
+        print("ORDER SAVE ERROR:", repr(exc), flush=True)
 
         if "Not enough" in message:
             raise HTTPException(status_code=409, detail=message)
@@ -494,23 +503,25 @@ def receive_delivery(
             detail="Could not record delivery in Supabase."
         )
 
+
 @app.post("/api/chat")
 def chat(
     data: dict,
     user=Depends(require_user),
 ):
+    from calendar import monthrange
+
     question = str(data.get("message", "")).strip().lower()
 
     if not question:
         raise HTTPException(status_code=400, detail="Enter a message.")
 
     try:
-        # Fetch real business data from Supabase.
         orders_result = (
-             supabase.table("orders")
-             .select("*")
-             .order("created_at", desc=True)
-             .execute()
+            supabase.table("orders")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
         )
         items_result = (
             supabase.table("order_items")
@@ -524,28 +535,130 @@ def chat(
         )
 
         orders_data = orders_result.data or []
-        latest_order = orders_data[0] if orders_data else None
         order_items = items_result.data or []
         ingredients = ingredients_result.data or []
 
+        tz = ZoneInfo("Asia/Kolkata")
+        now = datetime.now(tz)
+        today = now.date()
+
+        def order_datetime(order):
+            value = order.get("created_at")
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+                return parsed.astimezone(tz)
+            except (ValueError, TypeError):
+                return None
+
+        def in_period(order, start, end):
+            dt = order_datetime(order)
+            return dt is not None and start <= dt < end
+
+        def order_lines(order):
+            return [
+                item for item in order_items
+                if str(item["order_id"]) == str(order["id"])
+            ]
+
+        def format_order(order):
+            lines = order_lines(order)
+            items_text = ", ".join(
+                f"{item['item_name']} x {item['quantity']}"
+                for item in lines
+            ) or "item details unavailable"
+            dt = order_datetime(order)
+            date_text = dt.strftime("%d %b %Y, %I:%M %p") if dt else "date unavailable"
+            return (
+                f"Order #{order['id']} on {date_text}: {items_text}; "
+                f"total ₹{float(order['total']):,.2f} "
+                f"({order.get('payment_method', 'payment method unavailable')})."
+            )
+
+        def detect_period():
+            if "yesterday" in question:
+                start_date = today - timedelta(days=1)
+                return (
+                    datetime.combine(start_date, datetime.min.time(), tzinfo=tz),
+                    datetime.combine(today, datetime.min.time(), tzinfo=tz),
+                    "yesterday",
+                )
+
+            if "today" in question or "tonight" in question:
+                return (
+                    datetime.combine(today, datetime.min.time(), tzinfo=tz),
+                    datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=tz),
+                    "today",
+                )
+
+            if "last week" in question or "past week" in question:
+                start_date = today - timedelta(days=7)
+                return (
+                    datetime.combine(start_date, datetime.min.time(), tzinfo=tz),
+                    datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=tz),
+                    "the past 7 days",
+                )
+
+            if "this month" in question or "monthly" in question:
+                start_date = today.replace(day=1)
+                return (
+                    datetime.combine(start_date, datetime.min.time(), tzinfo=tz),
+                    datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=tz),
+                    "this month",
+                )
+
+            if "this week" in question:
+                start_date = today - timedelta(days=today.weekday())
+                return (
+                    datetime.combine(start_date, datetime.min.time(), tzinfo=tz),
+                    datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=tz),
+                    "this week",
+                )
+
+            return None
+
+        period = detect_period()
+
+        selected_orders = orders_data
+        period_label = "all recorded time"
+
+        if period:
+            start, end, period_label = period
+            selected_orders = [
+                order for order in orders_data
+                if in_period(order, start, end)
+            ]
+
         revenue = sum(float(o["total"]) for o in orders_data)
-        ingredient_cost = sum(
-            float(o.get("ingredient_cost") or 0)
-            for o in orders_data
-        )
-        estimated_profit = revenue - ingredient_cost
         order_count = len(orders_data)
 
-        # Calculate best sellers from saved order items.
+        # Synthetic demo orders have zero ingredient cost by design.
+        # Exclude them from estimated-profit calculations.
+        real_orders = [
+            o for o in orders_data
+            if not o.get("is_demo_seed", False)
+        ]
+        real_revenue = sum(float(o["total"]) for o in real_orders)
+        real_cost = sum(
+            float(o.get("ingredient_cost") or 0)
+            for o in real_orders
+        )
+        estimated_profit = real_revenue - real_cost
+
         item_sales = {}
         for item in order_items:
-            name = item["item_name"]
-            item_sales[name] = (
-                item_sales.get(name, 0) + int(item["quantity"])
+            item_sales[item["item_name"]] = (
+                item_sales.get(item["item_name"], 0)
+                + int(item["quantity"])
             )
 
         best = (
-            max(item_sales.items(), key=lambda item: item[1])
+            max(item_sales.items(), key=lambda pair: pair[1])
             if item_sales else None
         )
 
@@ -554,50 +667,133 @@ def chat(
             if float(item["quantity"]) <= float(item["reorder_level"])
         ]
 
-        
-        # Answer using the actual saved business data.
-        if any(phrase in question for phrase in [
+        # Match saved customer names against the user's question.
+        known_names = sorted(
+            {
+                str(o.get("customer_name", "")).strip()
+                for o in orders_data
+                if o.get("customer_name")
+            },
+            key=len,
+            reverse=True,
+        )
+        customer_name = next(
+            (
+                name for name in known_names
+                if name.lower() in question
+            ),
+            None,
+        )
+
+        customer_question = any(term in question for term in [
+            "customer", "purchase", "purchased", "bought",
+            "visit", "visited", "spent", "spend", "their order",
+            "his order", "her order", "previous order",
+            "order history", "ordered by",
+        ])
+
+        # 1. Customer history comes before general order/revenue logic.
+        if customer_name and (
+            customer_question
+            or "last order" in question
+            or "latest order" in question
+            or "order" in question
+        ):
+            customer_orders = [
+                o for o in orders_data
+                if str(o.get("customer_name", "")).strip().lower()
+                == customer_name.lower()
+            ]
+
+            if period:
+                customer_orders = [
+                    o for o in customer_orders
+                    if in_period(o, start, end)
+                ]
+
+            customer_orders.sort(
+                key=lambda o: order_datetime(o) or datetime.min.replace(tzinfo=tz),
+                reverse=True,
+            )
+
+            if not customer_orders:
+                answer = (
+                    f"I couldn't find orders for {customer_name}"
+                    + (f" during {period_label}." if period else ".")
+                )
+            elif any(term in question for term in ["how much", "spent", "spend", "total amount"]):
+                amount = sum(float(o["total"]) for o in customer_orders)
+                answer = (
+                    f"{customer_name} has spent ₹{amount:,.2f} across "
+                    f"{len(customer_orders)} recorded orders"
+                    + (f" during {period_label}." if period else ".")
+                )
+            elif any(term in question for term in ["how many", "number of", "times", "visit", "visited"]):
+                answer = (
+                    f"{customer_name} has {len(customer_orders)} recorded orders"
+                    + (f" during {period_label}." if period else ".")
+                )
+            elif any(term in question for term in ["last order", "latest order", "most recent"]):
+                answer = format_order(customer_orders[0])
+            else:
+                recent = customer_orders[:5]
+                answer = (
+                    f"{customer_name} has {len(customer_orders)} recorded orders. "
+                    + " ".join(format_order(o) for o in recent)
+                )
+                if len(customer_orders) > 5:
+                    answer += " Showing the five most recent orders."
+
+        # 2. Date-based business questions.
+        elif period and any(term in question for term in [
+            "revenue", "sales", "earning", "orders", "order count",
+            "how many", "total", "made", "busy"
+        ]):
+            period_revenue = sum(float(o["total"]) for o in selected_orders)
+
+            if any(term in question for term in ["how many", "number of", "count", "busy"]):
+                answer = (
+                    f"There were {len(selected_orders)} recorded orders "
+                    f"during {period_label}, totaling ₹{period_revenue:,.2f}."
+                )
+            else:
+                answer = (
+                    f"Recorded revenue during {period_label} was "
+                    f"₹{period_revenue:,.2f}, across "
+                    f"{len(selected_orders)} orders."
+                )
+
+        # 3. Specific latest order.
+        elif any(phrase in question for phrase in [
             "last order", "latest order", "most recent order",
             "recent order", "what was ordered", "what did we order",
             "what was the last"
         ]):
-            if latest_order:
-                latest_items = [
-                    item for item in order_items
-                    if str(item["order_id"]) == str(latest_order["id"])
-                ]
-
-                items_text = ", ".join(
-                    f"{item['item_name']} x {item['quantity']}"
-                    for item in latest_items
-                ) or "item details unavailable"
-
-                answer = (
-                    f"The latest order was {items_text}, "
-                    f"totaling ₹{float(latest_order['total']):,.2f}."
-                )
+            if orders_data:
+                latest_order = orders_data[0]
+                answer = format_order(latest_order)
             else:
                 answer = "There are no saved orders yet."
 
+        # 4. Inventory questions.
         elif any(word in question for word in [
             "stock", "ingredient", "inventory", "milk", "beans"
         ]):
-            requested_ingredient = next(
+            requested = next(
                 (
                     item for item in ingredients
-                    if item["name"].lower() in question
-                    or item["id"].lower() in question
+                    if str(item["name"]).lower() in question
+                    or str(item["id"]).lower() in question
                 ),
                 None,
             )
 
-            if requested_ingredient:
+            if requested:
                 answer = (
-                    f"{requested_ingredient['name']} stock is "
-                    f"{requested_ingredient['quantity']} "
-                    f"{requested_ingredient['unit']}."
+                    f"{requested['name']} stock is "
+                    f"{requested['quantity']} {requested['unit']}."
                 )
-                if requested_ingredient in low_stock:
+                if requested in low_stock:
                     answer += " This ingredient is at or below its reorder level."
             elif low_stock:
                 answer = "These ingredients need attention: " + ", ".join(
@@ -607,34 +803,52 @@ def chat(
             else:
                 answer = "No ingredients are currently below their reorder levels."
 
+        # 5. Best sellers.
         elif any(word in question for word in [
             "best", "popular", "selling", "product", "seller"
         ]):
             answer = (
-                f"{best[0]} is currently the best seller with "
-                f"{best[1]} units sold."
+                f"{best[0]} is currently the best seller with {best[1]} units sold."
                 if best else "No completed sales have been recorded yet."
             )
 
+        # 6. General revenue and profit.
         elif any(word in question for word in [
             "profit", "revenue", "sales", "earning", "order", "made"
         ]):
-            answer = (
-                f"Recorded revenue is ₹{revenue:,.2f} across "
-                f"{order_count} saved orders. Estimated profit after "
-                f"tracked ingredient costs is ₹{estimated_profit:,.2f}. "
-                "This excludes other operating expenses."
-            )
+            if "profit" in question:
+                answer = (
+                    f"Estimated profit from non-seeded orders is "
+                    f"₹{estimated_profit:,.2f}, based on recorded revenue "
+                    f"of ₹{real_revenue:,.2f} minus tracked ingredient costs "
+                    f"of ₹{real_cost:,.2f}. This excludes synthetic demo orders "
+                    "and other operating expenses."
+                )
+            else:
+                answer = (
+                    f"Recorded revenue is ₹{revenue:,.2f} across "
+                    f"{order_count} saved orders, including synthetic demo orders."
+                )
 
         else:
-            answer = (
-                f"I'm Happy, your Palm Bistro assistant! "
-                f"Recorded revenue is ₹{revenue:,.2f}, with "
-                f"{order_count} saved orders. "
-                "Ask me about sales, last orders, best-selling products, "
-                "profit, or ingredient stock."
-            )
-
+            if user["role"] == "owner":
+                answer = (
+                    f"Hey, boss! 🌱 Recorded revenue is ₹{revenue:,.2f} "
+                    f"across {order_count} saved orders. Ask about revenue "
+                    "today or yesterday, estimated profit, best sellers, "
+                    "or low stock."
+                )
+            elif user["role"] == "cashier":
+                answer = (
+                    "I'm Happy, your checkout buddy! 🌱 Ask about a customer's "
+                    "saved purchase history by their full name, the latest order, "
+                    "or today's and yesterday's orders."
+                )
+            else:
+                answer = (
+                    "I'm Happy, your stockroom buddy! 🌱 Ask about ingredient "
+                    "quantities, low stock, deliveries, or restocking needs."
+                )
 
         return {"answer": answer, "mode": "supabase-data"}
 
@@ -644,4 +858,110 @@ def chat(
         raise HTTPException(
             status_code=500,
             detail="Happy could not retrieve the latest business data."
+        )
+
+from fastapi import Query
+
+
+@app.get("/api/customers/search")
+def search_customers(
+    q: str = Query(default="", max_length=120),
+    user=Depends(require_role("cashier", "owner")),
+):
+    query = q.strip()
+
+    if len(query) < 2:
+        return {"customers": []}
+
+    try:
+        result = (
+            supabase.table("orders")
+            .select("customer_name")
+            .ilike("customer_name", f"%{query}%")
+            .limit(100)
+            .execute()
+        )
+
+        names = sorted({
+            row["customer_name"].strip()
+            for row in (result.data or [])
+            if row.get("customer_name")
+            and row["customer_name"].strip()
+        }, key=str.lower)
+
+        return {"customers": names[:10]}
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not search customer records.",
+        )
+
+
+@app.post("/api/customers/history")
+def customer_history(
+    data: dict,
+    user=Depends(require_role("cashier", "owner")),
+):
+    name = str(data.get("customer_name", "")).strip()
+
+    if not name or len(name) > 120:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid customer name.",
+        )
+
+    try:
+        orders_result = (
+            supabase.table("orders")
+            .select("id,customer_name,total,payment_method,created_at")
+            .ilike("customer_name", name)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+
+        matching_orders = [
+            order for order in (orders_result.data or [])
+            if (order.get("customer_name") or "").strip().casefold()
+            == name.casefold()
+        ]
+
+        if not matching_orders:
+            return {"customer_name": name, "orders": []}
+
+        order_ids = [order["id"] for order in matching_orders]
+
+        items_result = (
+            supabase.table("order_items")
+            .select("order_id,menu_item_id,item_name,quantity,unit_price")
+            .in_("order_id", order_ids)
+            .execute()
+        )
+
+        items_by_order = {}
+        for item in items_result.data or []:
+            items_by_order.setdefault(str(item["order_id"]), []).append({
+                "menu_item_id": item["menu_item_id"],
+                "name": item["item_name"],
+                "quantity": item["quantity"],
+                "unit_price": float(item["unit_price"]),
+            })
+
+        orders = []
+        for order in matching_orders:
+            orders.append({
+                **order,
+                "total": float(order["total"]),
+                "items": items_by_order.get(str(order["id"]), []),
+            })
+
+        return {"customer_name": name, "orders": orders}
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve customer order history.",
         )

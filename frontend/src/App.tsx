@@ -78,8 +78,43 @@ function App() {
   const [page, setPage] = useState('Overview')
   const [cart, setCart] = useState<Record<string, number>>({})
   const [payment, setPayment] = useState('Cash')
+  const [customerName, setCustomerName] = useState('')
+  const [customerOrders, setCustomerOrders] = useState<any[]>([])
+  const [customerLookupBusy, setCustomerLookupBusy] = useState(false)
+  const [customerSuggestions, setCustomerSuggestions] = useState<string[]>([])
   const [paymentConfirmed, setPaymentConfirmed] = useState(false)
-  const [chatInput, setChatInput] = useState('')
+  
+  const [chatInputs, setChatInputs] = useState<Record<string, string>>({
+    owner: '',
+    cashier: '',
+    inventory: '',
+  })
+
+  
+  const [chatHistories, setChatHistories] = useState<
+    Record<string, { role: string; text: string }[]>
+  >({
+    owner: [
+      {
+        role: 'happy',
+        text: "Good to see you, boss! 🌱 I'm ready to help you understand Palm Bistro's performance. Ask me about revenue, estimated profit, best sellers, sales trends, or stock that needs attention.",
+      },
+    ],
+    cashier: [
+      {
+        role: 'happy',
+        text: "Hey there! 🌱 I'm here to make your shift easier. I can help with order totals, payment methods, today's orders, and customers' previous purchases. What do you need?",
+      },
+    ],
+    inventory: [
+      {
+        role: 'happy',
+        text: "Hey, stockroom hero! 🌱 Let's keep Palm Bistro prepared. Ask me about ingredient levels, low stock, deliveries, usage, or what needs restocking.",
+      },
+    ],
+  })
+
+
   const [chatMessages, setChatMessages] = useState<{ role: string; text: string }[]>([
     { role: 'happy', text: 'Hey! I’m Happy 🌱 Ask me about Palm Bistro’s sales, popular products, or ingredient stock.' },
   ])
@@ -165,36 +200,93 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token])
 
-  async function completeOrder() {
-    const items = Object.entries(cart)
-      .filter(([, quantity]) => quantity > 0)
-      .map(([menu_id, quantity]) => ({ menu_id, quantity }))
+  
+async function completeOrder() {
+  const items = Object.entries(cart)
+    .filter(([, quantity]) => quantity > 0)
+    .map(([menu_id, quantity]) => ({ menu_id, quantity }))
 
-    if (!items.length) {
-      setToast('Add at least one menu item.')
-      return
-    }
-    if (!paymentConfirmed) {
-      setToast('Confirm that payment was received first.')
-      return
-    }
-
-    setBusy(true)
-    try {
-      const result = await api('/api/orders', {
-        method: 'POST',
-        body: JSON.stringify({ items, payment_method: payment, payment_confirmed: true }),
-      })
-      setToast(`Order #${result.order.id} completed · ${payment} · Collected by ${result.order.collected_by}`)
-      setCart({})
-      setPaymentConfirmed(false)
-      await refreshDashboard()
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : 'Order failed.')
-    } finally {
-      setBusy(false)
-    }
+  if (!items.length) {
+    setToast('Add at least one menu item.')
+    return
   }
+  if (!paymentConfirmed) {
+    setToast('Confirm that payment was received first.')
+    return
+  }
+
+  setBusy(true)
+  try {
+    const result = await api('/api/orders', {
+      method: 'POST',
+      body: JSON.stringify({
+        items,
+        payment_method: payment,
+        payment_confirmed: true,
+        customer_name: customerName.trim() || null,
+      }),
+    })
+
+    setToast(
+      `Order #${result.order.id} completed · ${payment} · ${
+        result.order.customer_name
+          ? `Customer: ${result.order.customer_name} · `
+          : ''
+      }Collected by ${result.order.collected_by}`
+    )
+
+    setCart({})
+    setCustomerName('')
+    setPaymentConfirmed(false)
+    await refreshDashboard()
+  } catch (error) {
+    setToast(error instanceof Error ? error.message : 'Order failed.')
+  } finally {
+    setBusy(false)
+  }
+}
+
+async function searchCustomers(value: string) {
+  const query = value.trim()
+
+  if (query.length < 2) {
+    setCustomerSuggestions([])
+    return
+  }
+
+  try {
+    const result = await api(
+      `/api/customers/search?q=${encodeURIComponent(query)}`
+    )
+    setCustomerSuggestions(result.customers || [])
+  } catch {
+    setCustomerSuggestions([])
+  }
+}
+
+async function loadCustomerHistory(name: string) {
+  setCustomerName(name)
+  setCustomerSuggestions([])
+  setCustomerLookupBusy(true)
+
+  try {
+    const result = await api('/api/customers/history', {
+      method: 'POST',
+      body: JSON.stringify({ customer_name: name }),
+    })
+
+    setCustomerOrders(result.orders || [])
+  } catch (error) {
+    setCustomerOrders([])
+    setToast(
+      error instanceof Error
+        ? error.message
+        : 'Could not load customer history.'
+    )
+  } finally {
+    setCustomerLookupBusy(false)
+  }
+}
 
   async function receiveDelivery(item: Ingredient) {
     const raw = window.prompt(`Quantity received for ${item.name} (${item.unit}):`)
@@ -216,25 +308,58 @@ function App() {
     }
   }
 
-  async function askHappy(event: React.FormEvent) {
-    event.preventDefault()
-    const message = chatInput.trim()
-    if (!message) return
-    setChatMessages((previous) => [...previous, { role: 'user', text: message }])
-    setChatInput('')
-    try {
-      const result = await api('/api/chat', {
-        method: 'POST',
-        body: JSON.stringify({ message }),
-      })
-      setChatMessages((previous) => [...previous, { role: 'happy', text: result.answer }])
-    } catch (error) {
-      setChatMessages((previous) => [...previous, {
-        role: 'happy',
-        text: error instanceof Error ? error.message : 'I couldn’t answer that just now.',
-      }])
-    }
+  
+async function askHappy(
+  event: React.FormEvent,
+  role: 'owner' | 'cashier' | 'inventory'
+) {
+  event.preventDefault()
+
+  const message = chatInputs[role].trim()
+  if (!message) return
+
+  setChatHistories((previous) => ({
+    ...previous,
+    [role]: [
+      ...previous[role],
+      { role: 'user', text: message },
+    ],
+  }))
+
+  setChatInputs((previous) => ({
+    ...previous,
+    [role]: '',
+  }))
+
+  try {
+    const result = await api('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message }),
+    })
+
+    setChatHistories((previous) => ({
+      ...previous,
+      [role]: [
+        ...previous[role],
+        { role: 'happy', text: result.answer },
+      ],
+    }))
+  } catch (error) {
+    setChatHistories((previous) => ({
+      ...previous,
+      [role]: [
+        ...previous[role],
+        {
+          role: 'happy',
+          text: error instanceof Error
+            ? error.message
+            : 'I couldn’t answer that just now.',
+        },
+      ],
+    }))
   }
+}
+
 
   if (!user) {
     return (
@@ -334,7 +459,14 @@ function App() {
               </section>
             </div>
             <OrdersTable orders={dashboard.recent_orders || []} />
-            <HappyPanel messages={chatMessages} input={chatInput} setInput={setChatInput} onSubmit={askHappy} />
+            
+            <HappyPanel
+              messages={chatHistories.owner}
+              input={chatInputs.owner}
+              setInput={(value) => setChatInputs((previous) => ({ ...previous, owner: value }))}
+              onSubmit={(event) => askHappy(event, 'owner')}
+            />
+
           </div>
         )}
 
@@ -346,6 +478,109 @@ function App() {
             </section>
             <section className="card checkout-card">
               <span className="eyebrow">CURRENT ORDER</span><h3>Checkout</h3>
+              
+              <label className="field-label" htmlFor="customer-name">
+                CUSTOMER NAME (OPTIONAL)
+              </label>
+              
+              <input
+                id="customer-name"
+                className="customer-name-input"
+                type="text"
+                placeholder="Enter customer's full name"
+                value={customerName}
+                onChange={(e) => {
+                  setCustomerName(e.target.value)
+                  setCustomerOrders([])
+                  void searchCustomers(e.target.value)
+                }}
+                maxLength={120}
+              />
+
+              {customerSuggestions.length > 0 && (
+                <div className="customer-suggestions">
+                  {customerSuggestions.map((name) => (
+                    <button
+                      type="button"
+                      key={name}
+                      className="customer-suggestion"
+                      onClick={() => void loadCustomerHistory(name)}
+                    >
+                      {name}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+
+{customerName.trim() && (
+  <div className="customer-history">
+    <h4>Previous orders</h4>
+
+    {customerLookupBusy ? (
+      <p>Loading order history…</p>
+    ) : customerOrders.length === 0 ? (
+      <p className="checkout-note">
+        Select a customer name above to view their previous orders.
+      </p>
+    ) : (
+      customerOrders.map((order) => (
+        <div className="customer-order-card" key={order.id}>
+          <div className="customer-order-heading">
+            <strong>Order #{order.id}</strong>
+            <strong>{rupees(order.total)}</strong>
+          </div>
+
+          <small>
+            {new Date(order.created_at).toLocaleString('en-IN', {
+              dateStyle: 'medium',
+              timeStyle: 'short',
+            })}
+          </small>
+
+          <div className="customer-order-items">
+            {order.items.map((item: any, index: number) => (
+              <div key={`${order.id}-${item.menu_item_id}-${index}`}>
+                {item.name} × {item.quantity}
+              </div>
+            ))}
+          </div>
+
+          <button
+            type="button"
+            className="secondary-button full-button"
+            onClick={() => {
+              const repeatedItems = order.items.reduce(
+                (next: Record<string, number>, item: any) => {
+                  next[item.menu_item_id] =
+                    (next[item.menu_item_id] || 0) + item.quantity
+                  return next
+                },
+                {} as Record<string, number>
+              )
+
+              setCart((current) => {
+                const updated = { ...current }
+
+                for (const [id, quantity] of Object.entries(repeatedItems)) {
+                  updated[id] = (updated[id] || 0) + Number(quantity)
+                }
+
+                return updated
+              })
+
+              setPaymentConfirmed(false)
+              setToast(`Order #${order.id} items added to the cart.`)
+            }}
+          >
+            Repeat order →
+          </button>
+        </div>
+      ))
+    )}
+  </div>
+)}
+
               {Object.entries(cart).filter(([, q]) => q > 0).length === 0 ? <div className="empty-cart"><span>＋</span><p>Your order starts here.</p><small>Add something delicious from the menu.</small></div> : <div className="cart-lines">{Object.entries(cart).filter(([, q]) => q > 0).map(([id, quantity]) => { const item = menu.find((m) => m.id === id); return item ? <div className="cart-line" key={id}><div><strong>{item.name}</strong><small>{quantity} × {rupees(item.price)}</small></div><b>{rupees(quantity * item.price)}</b></div> : null })}</div>}
               <div className="checkout-total"><span>Total</span><strong>{rupees(menu.reduce((sum, item) => sum + item.price * (cart[item.id] || 0), 0))}</strong></div>
               <span className="field-label">PAYMENT METHOD</span><div className="payment-options">{['Cash', 'UPI', 'Card'].map((method) => <button key={method} className={payment === method ? 'payment-option chosen' : 'payment-option'} onClick={() => { setPayment(method); setPaymentConfirmed(false) }}><span>{method === 'Cash' ? '₹' : method === 'UPI' ? '⌁' : '▣'}</span>{method}</button>)}</div>
@@ -353,6 +588,15 @@ function App() {
               <button className="primary-button full-button" disabled={busy || !paymentConfirmed || !Object.values(cart).some((q) => q > 0)} onClick={completeOrder}>{busy ? 'Completing…' : 'Complete order →'}</button>
               <p className="checkout-note">Completed orders update sales and ingredient stock.</p>
             </section>
+
+            
+            <HappyPanel
+              messages={chatHistories.cashier}
+              input={chatInputs.cashier}
+              setInput={(value) => setChatInputs((previous) => ({ ...previous, cashier: value }))}
+              onSubmit={(event) => askHappy(event, 'cashier')}
+            />
+
           </div>
         )}
 
@@ -362,6 +606,12 @@ function App() {
             <section className="metric-grid inventory-metrics"><Metric label="Ingredients tracked" value={String(stockItems.length)} note="Across the stockroom" icon="▤" /><Metric label="Needs replenishing" value={String((dashboard.low_stock || []).length)} note="At or below reorder level" icon="!" /><Metric label="Recorded orders" value={String(dashboard.recent_orders?.length || 0)} note="Recent transactions" icon="↗" /></section>
             <section className="card"><div className="card-heading"><div><span className="eyebrow">INGREDIENTS</span><h3>Inventory overview</h3></div><span className="subtle-pill">Live demo stock</span></div><div className="inventory-list">{stockItems.map((item) => { const low = item.quantity <= item.reorder_level; const percentage = Math.min(100, item.quantity / (item.reorder_level * 3) * 100); return <div className="inventory-row" key={item.id}><div className="ingredient-icon">{item.id === 'beans' ? '☕' : item.id === 'milk' ? '♧' : item.id === 'bread' ? '♨' : '◇'}</div><div className="ingredient-info"><strong>{item.name}</strong><small>Reorder at {item.reorder_level.toLocaleString()} {item.unit}</small><div className="stock-track"><span className={low ? 'low' : ''} style={{ width: `${percentage}%` }} /></div></div><div className="stock-quantity"><strong>{item.quantity.toLocaleString()}</strong><small>{item.unit}</small></div><span className={low ? 'stock-badge low-badge' : 'stock-badge'}>{low ? 'Low stock' : 'In stock'}</span><button className="secondary-button" onClick={() => receiveDelivery(item)}>＋ Receive</button></div> })}</div></section>
             <OrdersTable orders={dashboard.recent_orders || []} />
+                          <HappyPanel
+                          messages={chatHistories.inventory}
+                          input={chatInputs.inventory}
+                          setInput={(value) => setChatInputs((previous) => ({ ...previous, inventory: value }))}
+                          onSubmit={(event) => askHappy(event, 'inventory')}
+                          />
           </div>
         )}
 
