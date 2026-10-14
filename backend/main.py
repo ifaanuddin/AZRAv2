@@ -243,38 +243,125 @@ def me(user=Depends(require_user)):
 
 @app.get("/api/dashboard")
 def dashboard(user=Depends(require_user)):
-    with lock:
-        metrics = calculate_metrics()
+    try:
+        orders_result = (
+            supabase.table("orders")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(8)
+            .execute()
+        )
+        ingredients_result = (
+            supabase.table("ingredients")
+            .select("*")
+            .execute()
+        )
+        all_orders_result = (
+            supabase.table("orders")
+            .select("*")
+            .execute()
+        )
+        order_items_result = (
+            supabase.table("order_items")
+            .select("*")
+            .execute()
+        )
+
+        recent_orders = orders_result.data or []
+        ingredients = ingredients_result.data or []
+        all_orders = all_orders_result.data or []
+        order_items = order_items_result.data or []
+
+        total_revenue = sum(float(o["total"]) for o in all_orders)
+        total_cost = sum(float(o["ingredient_cost"]) for o in all_orders)
+        total_orders = len(all_orders)
+
+        today = __import__("datetime").date.today()
+        today_orders = [
+            o for o in all_orders
+            if o.get("created_at", "")[:10] == today.isoformat()
+        ]
+        today_revenue = sum(float(o["total"]) for o in today_orders)
+
+        metrics = {
+            "revenue": round(total_revenue, 2),
+            "profit": round(total_revenue - total_cost, 2),
+            "orders": total_orders,
+            "average_order": round(
+                total_revenue / total_orders, 2
+            ) if total_orders else 0,
+            "sales_by_day": [],
+            "top_items": [],
+        }
+
+        item_sales = {}
+        for item in order_items:
+            name = item["item_name"]
+            item_sales[name] = (
+                item_sales.get(name, 0) + item["quantity"]
+            )
+
+        metrics["top_items"] = [
+            {"name": name, "quantity": quantity}
+            for name, quantity in sorted(
+                item_sales.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]
+        ]
+
         low_stock = [
-            item.copy() for item in stock.values()
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "quantity": item["quantity"],
+                "unit": item["unit"],
+                "reorder_level": item["reorder_level"],
+            }
+            for item in ingredients
             if item["quantity"] <= item["reorder_level"]
         ]
-        recent_orders = [o.copy() for o in reversed(orders[-8:])]
 
-    if user["role"] == "owner":
+        recent_order_items = {}
+        for item in order_items:
+            recent_order_items.setdefault(item["order_id"], []).append({
+                "name": item["item_name"],
+                "quantity": item["quantity"],
+                "unit_price": item["unit_price"],
+            })
+
+        for order in recent_orders:
+            order["items"] = recent_order_items.get(order["id"], [])
+
+        if user["role"] == "owner":
+            return {
+                "role": "owner",
+                "metrics": metrics,
+                "low_stock": low_stock,
+                "recent_orders": recent_orders,
+            }
+
+        if user["role"] == "cashier":
+            return {
+                "role": "cashier",
+                "today_orders": len(today_orders),
+                "today_revenue": round(today_revenue, 2),
+                "menu": MENU,
+                "recent_orders": recent_orders,
+            }
+
         return {
-            "role": "owner",
-            "metrics": metrics,
+            "role": "inventory",
+            "stock": ingredients,
             "low_stock": low_stock,
             "recent_orders": recent_orders,
         }
 
-    if user["role"] == "cashier":
-        return {
-            "role": "cashier",
-            "today_orders": metrics["orders"],
-            "today_revenue": metrics["revenue"],
-            "menu": MENU,
-            "recent_orders": recent_orders,
-        }
-
-    return {
-        "role": "inventory",
-        "stock": list(stock.values()),
-        "low_stock": low_stock,
-        "recent_orders": recent_orders,
-    }
-
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load dashboard data from Supabase."
+        )
 
 @app.get("/api/menu")
 def get_menu(user=Depends(require_user)):
