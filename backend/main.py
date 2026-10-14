@@ -499,42 +499,149 @@ def chat(
     data: dict,
     user=Depends(require_user),
 ):
-    # Grounded demo assistant. Connect a real AI provider later.
     question = str(data.get("message", "")).strip().lower()
+
     if not question:
         raise HTTPException(status_code=400, detail="Enter a message.")
 
-    with lock:
-        metrics = calculate_metrics()
+    try:
+        # Fetch real business data from Supabase.
+        orders_result = (
+             supabase.table("orders")
+             .select("*")
+             .order("created_at", desc=True)
+             .execute()
+        )
+        items_result = (
+            supabase.table("order_items")
+            .select("order_id,item_name,quantity,unit_price")
+            .execute()
+        )
+        ingredients_result = (
+            supabase.table("ingredients")
+            .select("id,name,quantity,unit,reorder_level")
+            .execute()
+        )
+
+        orders_data = orders_result.data or []
+        latest_order = orders_data[0] if orders_data else None
+        order_items = items_result.data or []
+        ingredients = ingredients_result.data or []
+
+        revenue = sum(float(o["total"]) for o in orders_data)
+        ingredient_cost = sum(
+            float(o.get("ingredient_cost") or 0)
+            for o in orders_data
+        )
+        estimated_profit = revenue - ingredient_cost
+        order_count = len(orders_data)
+
+        # Calculate best sellers from saved order items.
+        item_sales = {}
+        for item in order_items:
+            name = item["item_name"]
+            item_sales[name] = (
+                item_sales.get(name, 0) + int(item["quantity"])
+            )
+
+        best = (
+            max(item_sales.items(), key=lambda item: item[1])
+            if item_sales else None
+        )
+
         low_stock = [
-            item["name"] for item in stock.values()
-            if item["quantity"] <= item["reorder_level"]
+            item for item in ingredients
+            if float(item["quantity"]) <= float(item["reorder_level"])
         ]
-        best = metrics["top_items"][0] if metrics["top_items"] else None
 
-    if any(word in question for word in ["stock", "ingredient", "inventory", "milk"]):
-        if low_stock:
-            answer = "These ingredients need attention: " + ", ".join(low_stock) + "."
+        
+        # Answer using the actual saved business data.
+        if any(phrase in question for phrase in [
+            "last order", "latest order", "most recent order",
+            "recent order", "what was ordered", "what did we order",
+            "what was the last"
+        ]):
+            if latest_order:
+                latest_items = [
+                    item for item in order_items
+                    if str(item["order_id"]) == str(latest_order["id"])
+                ]
+
+                items_text = ", ".join(
+                    f"{item['item_name']} x {item['quantity']}"
+                    for item in latest_items
+                ) or "item details unavailable"
+
+                answer = (
+                    f"The latest order was {items_text}, "
+                    f"totaling ₹{float(latest_order['total']):,.2f}."
+                )
+            else:
+                answer = "There are no saved orders yet."
+
+        elif any(word in question for word in [
+            "stock", "ingredient", "inventory", "milk", "beans"
+        ]):
+            requested_ingredient = next(
+                (
+                    item for item in ingredients
+                    if item["name"].lower() in question
+                    or item["id"].lower() in question
+                ),
+                None,
+            )
+
+            if requested_ingredient:
+                answer = (
+                    f"{requested_ingredient['name']} stock is "
+                    f"{requested_ingredient['quantity']} "
+                    f"{requested_ingredient['unit']}."
+                )
+                if requested_ingredient in low_stock:
+                    answer += " This ingredient is at or below its reorder level."
+            elif low_stock:
+                answer = "These ingredients need attention: " + ", ".join(
+                    f"{item['name']} ({item['quantity']} {item['unit']})"
+                    for item in low_stock
+                ) + "."
+            else:
+                answer = "No ingredients are currently below their reorder levels."
+
+        elif any(word in question for word in [
+            "best", "popular", "selling", "product", "seller"
+        ]):
+            answer = (
+                f"{best[0]} is currently the best seller with "
+                f"{best[1]} units sold."
+                if best else "No completed sales have been recorded yet."
+            )
+
+        elif any(word in question for word in [
+            "profit", "revenue", "sales", "earning", "order", "made"
+        ]):
+            answer = (
+                f"Recorded revenue is ₹{revenue:,.2f} across "
+                f"{order_count} saved orders. Estimated profit after "
+                f"tracked ingredient costs is ₹{estimated_profit:,.2f}. "
+                "This excludes other operating expenses."
+            )
+
         else:
-            answer = "No ingredients are currently below their reorder levels."
-    elif any(word in question for word in ["best", "popular", "selling", "product"]):
-        answer = (
-            f"{best['name']} is currently the best seller with "
-            f"{best['quantity']} units sold."
-            if best else "No completed sales have been recorded yet."
-        )
-    elif any(word in question for word in ["profit", "revenue", "sales", "earning"]):
-        answer = (
-            f"Recorded revenue is ₹{metrics['revenue']:,.2f} across "
-            f"{metrics['orders']} completed orders. Estimated profit after "
-            f"tracked ingredient costs is ₹{metrics['estimated_profit']:,.2f}. "
-            "This excludes other operating expenses."
-        )
-    else:
-        answer = (
-            f"I'm Happy, your Palm Bistro assistant! Recorded revenue is "
-            f"₹{metrics['revenue']:,.2f}, with {metrics['orders']} completed orders. "
-            "Ask me about sales, best-selling products, profit, or ingredient stock."
-        )
+            answer = (
+                f"I'm Happy, your Palm Bistro assistant! "
+                f"Recorded revenue is ₹{revenue:,.2f}, with "
+                f"{order_count} saved orders. "
+                "Ask me about sales, last orders, best-selling products, "
+                "profit, or ingredient stock."
+            )
 
-    return {"answer": answer, "mode": "demo-data"}
+
+        return {"answer": answer, "mode": "supabase-data"}
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Happy could not retrieve the latest business data."
+        )

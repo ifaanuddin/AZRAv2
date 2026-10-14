@@ -1,5 +1,5 @@
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const API = 'http://127.0.0.1:8000'
@@ -390,7 +390,57 @@ function OrdersTable({ orders }: { orders: Order[] }) {
 }
 
 function HappyPanel({ messages, input, setInput, onSubmit }: { messages: { role: string; text: string }[]; input: string; setInput: (value: string) => void; onSubmit: (event: React.FormEvent) => void }) {
-  return <section className="card happy-panel"><div className="card-heading"><div><span className="eyebrow">YOUR LITTLE BUSINESS COMPANION</span><h3>Talk to Happy</h3></div><span className="happy-dot">✳</span></div><div className="happy-messages">{messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><span className="chat-avatar">{message.role === 'happy' ? '✳' : 'Y'}</span><p>{message.text}</p></div>)}</div><form className="happy-input" onSubmit={onSubmit}><input id="happy-input" value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask about sales, profit or stock…" /><button aria-label="Send message">↑</button></form><small className="checkout-note">Happy uses recorded demo data. His answers are not a substitute for your accounts.</small></section>
+  
+const messagesContainerRef = useRef<HTMLDivElement>(null)
+
+useEffect(() => {
+  const container = messagesContainerRef.current
+  if (container) {
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: 'smooth',
+    })
+  }
+}, [messages])
+
+
+  return (
+    <section className="card happy-panel">
+      <div className="card-heading">
+        <div>
+          <span className="eyebrow">YOUR LITTLE BUSINESS COMPANION</span>
+          <h3>Talk to Happy</h3>
+        </div>
+        <span className="happy-dot">✳</span>
+      </div>
+
+      <div className="happy-messages" ref={messagesContainerRef}>
+        {messages.map((message, index) => (
+          <div key={index} className={`chat-message ${message.role}`}>
+            <span className="chat-avatar">
+              {message.role === 'happy' ? '✳' : 'Y'}
+            </span>
+            <p>{message.text}</p>
+          </div>
+        ))}
+        
+      </div>
+
+      <form className="happy-input" onSubmit={onSubmit}>
+        <input
+          id="happy-input"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask about sales, profit or stock…"
+        />
+        <button aria-label="Send message">↑</button>
+      </form>
+
+      <small className="checkout-note">
+        Happy uses recorded demo data. His answers are not a substitute for your accounts.
+      </small>
+    </section>
+  )
 }
 
 export default App
