@@ -441,18 +441,58 @@ def receive_delivery(
     data: StockDelivery,
     user=Depends(require_role("inventory", "owner")),
 ):
-    with lock:
-        item = stock.get(ingredient_id)
-        if not item:
-            raise HTTPException(status_code=404, detail="Ingredient not found.")
+    try:
+        # Verify the ingredient exists in Supabase.
+        result = (
+            supabase.table("ingredients")
+            .select("*")
+            .eq("id", ingredient_id)
+            .limit(1)
+            .execute()
+        )
 
-        item["quantity"] += data.quantity
+        if not result.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Ingredient not found."
+            )
+
+        # Record the delivery and update stock atomically via RPC.
+        delivery_result = supabase.rpc(
+            "record_palm_bistro_delivery",
+            {
+                "p_ingredient_id": ingredient_id,
+                "p_quantity": data.quantity,
+                "p_recorded_by": user["name"],
+            },
+        ).execute()
+
+        updated_ingredient = delivery_result.data
+
+        if isinstance(updated_ingredient, list):
+            updated_ingredient = (
+                updated_ingredient[0] if updated_ingredient else None
+            )
+
+        if not updated_ingredient:
+            raise HTTPException(
+                status_code=500,
+                detail="Delivery was not confirmed by the database."
+            )
+
         return {
             "message": "Delivery recorded.",
-            "ingredient": item.copy(),
+            "ingredient": updated_ingredient,
             "recorded_by": user["name"],
         }
 
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not record delivery in Supabase."
+        )
 
 @app.post("/api/chat")
 def chat(
